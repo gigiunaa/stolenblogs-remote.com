@@ -69,13 +69,11 @@ def clean_article(article):
 
     # გაასუფთავე ატრიბუტები
     for tag in article.find_all(True):
-        # მარტო სასარგებლო ტეგები დავტოვოთ
         if tag.name not in ["p", "h1", "h2", "h3", "ul", "ol", "li",
                             "img", "strong", "em", "b", "i", "a"]:
             tag.unwrap()
             continue
 
-        # img -> გაასუფთავე და ჩასვი სწორი src + alt
         if tag.name == "img":
             src = (
                 tag.get("src")
@@ -92,8 +90,6 @@ def clean_article(article):
 
             alt = tag.get("alt", "").strip() or "Image"
             tag.attrs = {"src": src or "", "alt": alt}
-
-        # სხვა ტეგებიდან ყველა class/id/data-* წავშალოთ
         else:
             tag.attrs = {}
 
@@ -133,43 +129,61 @@ def scrape_blog():
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # title
+        # ====================
+        # Title
+        # ====================
         title = None
         if soup.title:
             title = soup.title.string.strip()
         h1 = soup.find("h1")
         if h1 and not title:
             title = h1.get_text(strip=True)
+        title = title or ""
 
-        # blog content
+        # ====================
+        # Blog content
+        # ====================
         article = extract_blog_content(resp.text)
         if not article:
             return Response("Could not extract blog content", status=422)
 
-        # --------------------
+        # ====================
         # Images
-        # --------------------
+        # ====================
         images = []
+        banner_url = None
 
-        # 1) Banner (og:image) უნდა იყოს image1
+        # 1) Banner (og:image)
         og = soup.find("meta", property="og:image")
         if og and og.get("content"):
-            banner = og["content"].strip()
-            if banner:
-                images.append(banner)
+            banner_url = og["content"].strip()
+            if banner_url:
+                images.append(banner_url)
 
-        # 2) სტატიის შიგნით
+        # 2) Article images
         article_images = extract_images(article)
         for img in article_images:
             if img not in images:
                 images.append(img)
 
-        # 3) დანომვრა
+        # 3) Naming
         image_names = [f"image{i+1}.png" for i in range(len(images))]
 
+        # ====================
+        # Build content_html
+        # ====================
+        banner_html = ""
+        if banner_url:
+            banner_html = f'<p><img src="{banner_url}" alt="Banner"/></p>\n'
+
+        content_html = f"<h1>{title}</h1>\n{banner_html}{str(article).strip()}"
+
+        # ====================
+        # Result
+        # ====================
         result = {
-            "title": title or "",
-            "content_html": str(article).strip(),
+            "title": title,
+            "content_html": content_html,
             "images": images,
             "image_names": image_names,
         }
