@@ -69,8 +69,12 @@ def clean_article(article):
 
     # გაასუფთავე ატრიბუტები
     for tag in article.find_all(True):
-        if tag.name not in ["p", "h1", "h2", "h3", "ul", "ol", "li",
-                            "img", "strong", "em", "b", "i", "a"]:
+        if tag.name not in [
+            "p", "h1", "h2", "h3", "h4", "h5", "h6",
+            "ul", "ol", "li", "img",
+            "strong", "em", "b", "i", "a",
+            "table", "thead", "tbody", "tr", "th", "td"
+        ]:
             tag.unwrap()
             continue
 
@@ -110,6 +114,23 @@ def extract_blog_content(html: str):
                 break
     if not article:
         article = soup.body
+
+    # --- ამოვიღოთ h1 და banner ---
+    h1 = soup.find("h1")
+    banner_img = None
+
+    if h1:
+        next_img = h1.find_next("img")
+        if next_img:
+            banner_img = next_img
+
+    # article-ის თავში prepend
+    if h1:
+        article.insert(0, h1)
+    if banner_img:
+        wrapper_p = soup.new_tag("p")
+        wrapper_p.append(banner_img)
+        article.insert(1, wrapper_p)
 
     return clean_article(article)
 
@@ -172,11 +193,7 @@ def scrape_blog():
         # ====================
         # Build content_html
         # ====================
-        banner_html = ""
-        if banner_url:
-            banner_html = f'<p><img src="{banner_url}" alt="Banner"/></p>\n'
-
-        content_html = f"<h1>{title}</h1>\n{banner_html}{str(article).strip()}"
+        content_html = str(article).strip()
 
         # ====================
         # Result
