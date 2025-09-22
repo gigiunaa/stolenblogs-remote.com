@@ -6,6 +6,7 @@ import re
 import json
 import logging
 import requests
+from urllib.parse import urlparse
 from flask import Flask, request, Response
 from flask_cors import CORS
 from bs4 import BeautifulSoup
@@ -17,177 +18,255 @@ CORS(app)
 # ------------------------------
 # Helpers
 # ------------------------------
-def _normalize_url(url: str | None) -> str | None:
-    """Return a safe, Wix-friendly absolute URL:
-       - keep https
-       - don't decode %28/%29 etc.
-       - strip surrounding quotes/spaces
-       - remove ?query (HubSpot resizer) to fetch the original file
-    """
-    if not url:
-        return None
-    url = url.strip("\"' ")
-    if url.startswith("//"):
-        url = "https:" + url
-    # ვაქნეთ სუფთა ფაილის ბმული, query-ს გარეშე (Wix-ს ასე უადვილდება ჩამოტვირთვა)
-    if "?" in url:
-        url = url.split("?", 1)[0]
-    if url.startswith(("http://", "https://")):
-        return url
-    return None
+ABS_PREFIXES = ("http://", "https://")
 
-def _img_src_from_tag(img) -> str | None:
+def _normalize_url(u: str | None) -> str | None:
+    if not u:
+        return None
+    u = u.strip()
+    if not u:
+        return None
+    # protocol-relative -> https:
+    if u.startswith("//"):
+        u = "https:" + u
+    return u if u.startswith(ABS_PREFIXES) else None
+
+def _get_img_src(tag) -> str | None:
+    """Extract the most likely image URL from <img> with lazy attrs/srcset etc."""
     src = (
-        img.get("src")
-        or img.get("data-src")
-        or img.get("data-lazy-src")
-        or img.get("data-original")
-        or img.get("data-background")
+        tag.get("src")
+        or tag.get("data-src")
+        or tag.get("data-lazy-src")
+        or tag.get("data-original")
+        or tag.get("data-background")
     )
-    if not src and img.get("srcset"):
-        src = img["srcset"].split(",")[0].split()[0]
+    if not src and tag.get("srcset"):
+        try:
+            src = tag["srcset"].split(",")[0].split()[0]
+        except Exception:
+            src = None
     return _normalize_url(src)
 
-def extract_images(container):
-    """Order-preserving unique list of image URLs from container."""
-    seen = set()
-    out = []
+def _guess_ext_from_url(u: str) -> str:
+    """Try to keep original extension; default to png."""
+    try:
+        path = urlparse(u).path
+        ext = os.path.splitext(path)[1].lower()
+        if ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"]:
+            # svg uploads ზოგჯერ ბლოკირდება—საჩვენებლად დავტოვოთ, მაგრამ placeholder-ში ე.წ. svg-საც შევინარჩუნებთ
+            return ext.lstrip(".")
+    except Exception:
+        pass
+    return "png"
 
-    # <img>
+def extract_images(container):
+    """Collect absolute image URLs from any tags."""
+    image_urls = set()
+
+    # <img> + lazy attributes + srcset
     for img in container.find_all("img"):
-        src = _img_src_from_tag(img)
-        if src and src not in seen:
-            seen.add(src)
-            out.append(src)
+        u = _get_img_src(img)
+        if u:
+            image_urls.add(u)
 
     # <source srcset="...">
     for source in container.find_all("source"):
         srcset = source.get("srcset")
         if srcset:
-            first = srcset.split(",")[0].split()[0]
-            first = _normalize_url(first)
-            if first and first not in seen:
-                seen.add(first)
-                out.append(first)
+            first = srcset.split(",")[0].split()[0].strip()
+            u = _normalize_url(first)
+            if u:
+                image_urls.add(u)
 
     # style="background-image:url(...)"
     for tag in container.find_all(style=True):
-        style = tag.get("style") or ""
+        style = tag["style"]
         for match in re.findall(r"url\((.*?)\)", style):
-            url = _normalize_url(match)
-            if url and url not in seen:
-                seen.add(url)
-                out.append(url)
+            u = _normalize_url(match.strip("\"' "))
+            if u:
+                image_urls.add(u)
 
-    return out
+    return list(image_urls)
 
+# ------------------------------
+# Find banner URL
+# ------------------------------
 def find_banner_url(soup: BeautifulSoup):
-    """Try to get banner from wrapper or any element with background-image, fallback to og:image."""
-    # 1) explicit wrapper
+    # explicit wrapper
     wrap = soup.select_one(".wrapper-banner-image")
     if wrap:
         style = wrap.get("style")
         if style:
             m = re.search(r"background-image\s*:\s*url\((.*?)\)", style, re.IGNORECASE)
             if m:
-                url = _normalize_url(m.group(1))
-                if url:
-                    return url
+                u = _normalize_url(m.group(1).strip("\"' "))
+                if u:
+                    return u
         inner_img = wrap.find("img")
         if inner_img:
-            url = _img_src_from_tag(inner_img)
-            if url:
-                return url
+            u = _get_img_src(inner_img)
+            if u:
+                return u
 
-    # 2) any background-image
+    # any node with background-image
     any_bg = soup.find(style=re.compile(r"background-image\s*:\s*url\(", re.IGNORECASE))
     if any_bg:
         style = any_bg.get("style", "")
         m = re.search(r"background-image\s*:\s*url\((.*?)\)", style, re.IGNORECASE)
         if m:
-            url = _normalize_url(m.group(1))
-            if url:
-                return url
+            u = _normalize_url(m.group(1).strip("\"' "))
+            if u:
+                return u
 
-    # 3) og:image
+    # fallback: og:image
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
-        url = _normalize_url(og["content"].strip())
-        if url:
-            return url
+        u = _normalize_url(og["content"].strip())
+        if u:
+            return u
 
     return None
 
-def remove_author_images(article: BeautifulSoup):
-    """Remove likely author/avatar images (keeps content images)."""
-    to_remove = []
-    for img in article.find_all("img"):
-        alt = (img.get("alt") or "").strip().lower()
-        src = (_img_src_from_tag(img) or "").lower()
-        classes = " ".join(img.get("class", [])).lower()
-
-        # ჰეურისტიკები: ავტორი/ავატარი/byline
-        if any(k in alt for k in ["author", "avatar", "byline"]) \
-           or any(k in classes for k in ["author", "avatar", "byline"]) \
-           or "madeline%20grecek.png" in src \
-           or "madeline grecek" in alt:
-            to_remove.append(img)
-
-        # თუ img არის <p>-ში და ის <p> არაფერს სხვას არ შეიცავს (ხშირად ავტორის ბლოკი)
-        parent = img.parent
-        if parent and parent.name == "p":
-            only_img = True
-            for c in parent.children:
-                if getattr(c, "name", None) is None:
-                    # ტექსტი არსებობს და არა მხოლოდ whitespace?
-                    if str(c).strip():
-                        only_img = False
-                        break
-                elif c.name != "img":
-                    only_img = False
-                    break
-            if only_img and ("author" in classes or "avatar" in classes or "byline" in classes):
-                to_remove.append(parent)
-
-    for node in to_remove:
-        node.decompose()
-
 # ------------------------------
-# HTML გაწმენდა
+# Clean HTML (keep only safe tags/strip attrs except imgs/links)
 # ------------------------------
 def clean_article(article):
-    # წაშალე script/style/svg/noscript
     for tag in article(["script", "style", "svg", "noscript"]):
         tag.decompose()
 
-    # გაასუფთავე ატრიბუტები; <img> დატოვე ნორმალიზებული src/alt-ით
+    allow = {
+        "p","h1","h2","h3","h4","h5","h6",
+        "ul","ol","li","img","strong","em","b","i","a",
+        "table","thead","tbody","tr","th","td","figure"
+    }
     for tag in article.find_all(True):
-        if tag.name not in [
-            "p", "h1", "h2", "h3", "h4", "h5", "h6",
-            "ul", "ol", "li", "img",
-            "strong", "em", "b", "i", "a",
-            "table", "thead", "tbody", "tr", "th", "td"
-        ]:
+        if tag.name not in allow:
             tag.unwrap()
             continue
 
         if tag.name == "img":
-            src = _img_src_from_tag(tag) or ""
-            alt = (tag.get("alt") or "Image").strip()
-            tag.attrs = {"src": src, "alt": alt}
+            # do not normalize src here (we'll replace with placeholders later)
+            alt = tag.get("alt", "").strip() or "Image"
+            tag.attrs = {"alt": alt}
+        elif tag.name == "a":
+            href = tag.get("href")
+            href = _normalize_url(href) or "#"
+            tag.attrs = {"href": href, "rel": "noopener", "target": "_blank"}
+        elif tag.name == "figure":
+            # we'll control only data-img-slot later
+            tag.attrs = {}
         else:
-            # ყველა სხვა ატრიბუტი ვშლით, რომ სუფთა HTML მივიღოთ
             tag.attrs = {}
 
     return article
 
 # ------------------------------
-# Blog content extraction
+# Build placeholders + mapping
+# ------------------------------
+def apply_placeholders(article: BeautifulSoup, banner_url: str | None):
+    """
+    - Inserts banner as <p><figure data-img-slot="1"><img src="images/image1.ext" alt="Banner"/></figure></p>
+      if we have a banner_url.
+    - Replaces all <img> with images/imageN.ext placeholders.
+    - Adds unique data-img-slot only for the first occurrence of each unique image.
+    - Returns mapping (image_url_map), ordered images list, image_names list.
+    """
+    soup = article  # same object
+
+    image_url_map = {}           # filename -> original URL
+    name_for_url = {}            # original URL -> filename
+    images_list = []             # list of original URLs (ordered, unique)
+    image_names = []             # list of filenames (ordered, unique)
+    slot_counter = 1
+
+    def new_filename_for(url: str) -> str:
+        nonlocal slot_counter
+        ext = _guess_ext_from_url(url)
+        # for banner use 1, others increment from current length+1
+        idx = len(image_url_map) + 1
+        # but if we call for banner first, it will be image1
+        return f"image{idx}.{ext}"
+
+    # 1) Insert banner at top if present
+    if banner_url:
+        banner_url = _normalize_url(banner_url)
+        if banner_url:
+            fname = new_filename_for(banner_url)  # should become image1.ext
+            image_url_map[fname] = banner_url
+            name_for_url[banner_url] = fname
+            images_list.append(banner_url)
+            image_names.append(fname)
+
+            # Prepend <p><figure data-img-slot="1"><img .../></figure></p>
+            p = soup.new_tag("p")
+            fig = soup.new_tag("figure")
+            fig.attrs["data-img-slot"] = str(slot_counter)  # 1
+            img = soup.new_tag("img", src=f"images/{fname}", alt="Banner")
+            fig.append(img)
+            p.append(fig)
+            if soup.contents:
+                soup.insert(0, p)
+            else:
+                soup.append(p)
+            slot_counter += 1
+
+    # 2) Replace all imgs with placeholders (dedupe by URL)
+    for img in soup.find_all("img"):
+        # If this img is our freshly inserted banner placeholder, skip (it already has placeholder)
+        existing_src = img.get("src")
+        if existing_src and existing_src.startswith("images/image") and "Banner" in (img.get("alt") or ""):
+            continue
+
+        url = _get_img_src(img)
+        if not url:
+            # no valid absolute URL -> drop the image entirely
+            img.decompose()
+            continue
+
+        # Already seen?
+        if url in name_for_url:
+            fname = name_for_url[url]
+            # reuse placeholder
+            img["src"] = f"images/{fname}"
+            # ensure alt present
+            if not img.get("alt"):
+                img["alt"] = "Image"
+            # DO NOT assign another slot for duplicates
+            # If parent is figure with data-img-slot, remove the slot to avoid duplicates
+            if img.parent and img.parent.name == "figure":
+                if "data-img-slot" in img.parent.attrs:
+                    del img.parent.attrs["data-img-slot"]
+        else:
+            # First time we see this URL
+            fname = new_filename_for(url)
+            name_for_url[url] = fname
+            image_url_map[fname] = url
+            images_list.append(url)
+            image_names.append(fname)
+
+            img["src"] = f"images/{fname}"
+            if not img.get("alt"):
+                img["alt"] = "Image"
+
+            # Wrap in <figure data-img-slot="N"> (unique)
+            if img.parent and img.parent.name == "figure":
+                fig = img.parent
+            else:
+                fig = soup.new_tag("figure")
+                img.replace_with(fig)
+                fig.append(img)
+            fig.attrs["data-img-slot"] = str(slot_counter)
+            slot_counter += 1
+
+    return soup, image_url_map, images_list, image_names
+
+# ------------------------------
+# Extract blog content
 # ------------------------------
 def extract_blog_content(html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    # მთავარი article მოძებნე
+    # main article
     article = soup.find("article")
     if not article:
         for cls in ["blog-content", "post-content", "entry-content", "content", "article-body"]:
@@ -195,28 +274,24 @@ def extract_blog_content(html: str):
             if article:
                 break
     if not article:
-        article = soup.body
+        article = soup.body or soup
 
-    # --- H1 ---
     h1 = soup.find("h1")
 
-    # --- ბანერი მოძებნე ---
+    # find banner by rules (wrapper/style/og:image)
     banner_url = find_banner_url(soup)
 
-    # article-ის თავში: ჯერ H1 (თუ იარსება), მერე ბანერი როგორც <p><img .../></p>
+    # prepend H1 if not already inside article
     if h1:
         article.insert(0, h1)
-    if banner_url:
-        p = soup.new_tag("p")
-        img = soup.new_tag("img", src=banner_url, alt="Banner")
-        p.append(img)
-        article.insert(1, p)
 
-    # ავტორის სურათების მოცილება (თუ დარჩა)
-    remove_author_images(article)
+    # Clean tags/attrs first
+    article = clean_article(article)
 
-    # გაწმენდა და ნორმალიზაცია
-    return clean_article(article)
+    # Now replace imgs with placeholders + insert banner figure at top
+    article, image_url_map, images_list, image_names = apply_placeholders(article, banner_url)
+
+    return article, image_url_map, images_list, image_names
 
 # ------------------------------
 # API
@@ -234,52 +309,30 @@ def scrape_blog():
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # ====================
         # Title
-        # ====================
         title = None
-        if soup.title:
-            title = (soup.title.string or "").strip()
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
         h1 = soup.find("h1")
         if h1 and not title:
             title = h1.get_text(strip=True)
         title = title or ""
 
-        # ====================
-        # Blog content
-        # ====================
-        article = extract_blog_content(resp.text)
+        # Content + placeholders/mapping
+        article, image_url_map, images, image_names = extract_blog_content(resp.text)
         if not article:
             return Response("Could not extract blog content", status=422)
 
-        # ====================
-        # Images (order-preserving unique)
-        # ====================
-        images = []
-        banner_url = find_banner_url(soup)
-        if banner_url:
-            images.append(banner_url)
-
-        for img in extract_images(article):
-            if img not in images:
-                images.append(img)
-
-        # სახელების გენერაცია
-        image_names = [f"image{i+1}.png" for i in range(len(images))]
-
-        # ====================
-        # Build content_html
-        # ====================
         content_html = str(article).strip()
 
-        # ====================
-        # Result
-        # ====================
         result = {
             "title": title,
             "content_html": content_html,
-            "images": images,
-            "image_names": image_names,
+            # Keep legacy fields (some clients use them)
+            "images": images,                # list of original URLs (unique, ordered)
+            "image_names": image_names,      # corresponding filenames
+            # Add the crucial map for the converter
+            "image_url_map": image_url_map   # {"image1.png": "https://...", ...}
         }
         return Response(json.dumps(result, ensure_ascii=False), mimetype="application/json")
 
