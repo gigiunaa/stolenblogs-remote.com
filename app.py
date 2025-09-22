@@ -15,16 +15,27 @@ app = Flask(__name__)
 CORS(app)
 
 # ------------------------------
-# Helper: URL-ში ფრჩხილების დექოდერი (%28/%29 -> ( / ))
+# Helpers
 # ------------------------------
-def _fix_paren_encoding(u: str) -> str:
-    if not u:
-        return u
-    return u.strip("\"' ").replace("%28", "(").replace("%29", ")")
+def _normalize_url(url: str | None) -> str | None:
+    """Return a safe, Wix-friendly absolute URL:
+       - keep https
+       - don't decode %28/%29 etc.
+       - strip surrounding quotes/spaces
+       - remove ?query (HubSpot resizer) to fetch the original file
+    """
+    if not url:
+        return None
+    url = url.strip("\"' ")
+    if url.startswith("//"):
+        url = "https:" + url
+    # ვაქნეთ სუფთა ფაილის ბმული, query-ს გარეშე (Wix-ს ასე უადვილდება ჩამოტვირთვა)
+    if "?" in url:
+        url = url.split("?", 1)[0]
+    if url.startswith(("http://", "https://")):
+        return url
+    return None
 
-# ------------------------------
-# Helper: <img> tag-იდან SRC ამოღება (lazy/srcset მხარდაჭერით)
-# ------------------------------
 def _img_src_from_tag(img) -> str | None:
     src = (
         img.get("src")
@@ -35,114 +46,121 @@ def _img_src_from_tag(img) -> str | None:
     )
     if not src and img.get("srcset"):
         src = img["srcset"].split(",")[0].split()[0]
-    if src and src.startswith("//"):
-        src = "https:" + src
-    return _fix_paren_encoding(src) if src else None
+    return _normalize_url(src)
 
-# ------------------------------
-# Helper: სავარაუდო ავტორის ჰედშოტის ამოცნობა
-# ------------------------------
-def _looks_like_headshot(img) -> bool:
-    alt = (img.get("alt") or "").strip()
-    src = _img_src_from_tag(img) or ""
-    # სახელისა და გვარის მსგავსი ALT
-    if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$", alt):
-        return True
-    # ცნობილი შემთხვევა ამ ბლოგისთვის
-    if "Madeline%20Grecek" in src or "Madeline Grecek" in src:
-        return True
-    return False
-
-# ------------------------------
-# Helper: ბანერის URL-ის პოვნა
-# ------------------------------
-def find_banner_url(soup: BeautifulSoup):
-    # 1) wrapper-banner-image
-    wrap = soup.select_one(".wrapper-banner-image")
-    if wrap:
-        # ჯერ inner <img>
-        inner_img = wrap.find("img")
-        if inner_img:
-            src = _img_src_from_tag(inner_img)
-            if src and src.startswith(("http://", "https://")):
-                return src
-        # შემდეგ style="background-image:url(...)"
-        style = wrap.get("style")
-        if style:
-            m = re.search(r"background-image\s*:\s*url\((.*?)\)", style, re.IGNORECASE)
-            if m:
-                url = _fix_paren_encoding(m.group(1))
-                if url.startswith("//"):
-                    url = "https:" + url
-                if url.startswith(("http://", "https://")):
-                    return url
-
-    # 2) fallback: ნებისმიერი ელემენტი background-image:url(...)
-    any_bg = soup.find(style=re.compile(r"background-image\s*:\s*url\(", re.IGNORECASE))
-    if any_bg:
-        m = re.search(r"background-image\s*:\s*url\((.*?)\)", any_bg.get("style", ""), re.IGNORECASE)
-        if m:
-            url = _fix_paren_encoding(m.group(1))
-            if url.startswith("//"):
-                url = "https:" + url
-            if url.startswith(("http://", "https://")):
-                return url
-
-    # 3) fallback: og:image
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        url = _fix_paren_encoding(og["content"].strip())
-        if url.startswith("//"):
-            url = "https:" + url
-        if url.startswith(("http://", "https://")):
-            return url
-
-    return None
-
-# ------------------------------
-# Helper: სურათების ამოღება (ყველგან + დექოდერი)
-# ------------------------------
 def extract_images(container):
-    image_urls = set()
+    """Order-preserving unique list of image URLs from container."""
+    seen = set()
+    out = []
 
-    # <img> + lazy + srcset
+    # <img>
     for img in container.find_all("img"):
         src = _img_src_from_tag(img)
-        if src and src.startswith(("http://", "https://")):
-            image_urls.add(src)
+        if src and src not in seen:
+            seen.add(src)
+            out.append(src)
 
     # <source srcset="...">
     for source in container.find_all("source"):
         srcset = source.get("srcset")
         if srcset:
             first = srcset.split(",")[0].split()[0]
-            if first.startswith("//"):
-                first = "https:" + first
-            first = _fix_paren_encoding(first)
-            if first.startswith(("http://", "https://")):
-                image_urls.add(first)
+            first = _normalize_url(first)
+            if first and first not in seen:
+                seen.add(first)
+                out.append(first)
 
     # style="background-image:url(...)"
     for tag in container.find_all(style=True):
-        style = tag["style"]
+        style = tag.get("style") or ""
         for match in re.findall(r"url\((.*?)\)", style):
-            url = _fix_paren_encoding(match)
-            if url.startswith("//"):
-                url = "https:" + url
-            if url.startswith(("http://", "https://")):
-                image_urls.add(url)
+            url = _normalize_url(match)
+            if url and url not in seen:
+                seen.add(url)
+                out.append(url)
 
-    return list(image_urls)
+    return out
+
+def find_banner_url(soup: BeautifulSoup):
+    """Try to get banner from wrapper or any element with background-image, fallback to og:image."""
+    # 1) explicit wrapper
+    wrap = soup.select_one(".wrapper-banner-image")
+    if wrap:
+        style = wrap.get("style")
+        if style:
+            m = re.search(r"background-image\s*:\s*url\((.*?)\)", style, re.IGNORECASE)
+            if m:
+                url = _normalize_url(m.group(1))
+                if url:
+                    return url
+        inner_img = wrap.find("img")
+        if inner_img:
+            url = _img_src_from_tag(inner_img)
+            if url:
+                return url
+
+    # 2) any background-image
+    any_bg = soup.find(style=re.compile(r"background-image\s*:\s*url\(", re.IGNORECASE))
+    if any_bg:
+        style = any_bg.get("style", "")
+        m = re.search(r"background-image\s*:\s*url\((.*?)\)", style, re.IGNORECASE)
+        if m:
+            url = _normalize_url(m.group(1))
+            if url:
+                return url
+
+    # 3) og:image
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        url = _normalize_url(og["content"].strip())
+        if url:
+            return url
+
+    return None
+
+def remove_author_images(article: BeautifulSoup):
+    """Remove likely author/avatar images (keeps content images)."""
+    to_remove = []
+    for img in article.find_all("img"):
+        alt = (img.get("alt") or "").strip().lower()
+        src = (_img_src_from_tag(img) or "").lower()
+        classes = " ".join(img.get("class", [])).lower()
+
+        # ჰეურისტიკები: ავტორი/ავატარი/byline
+        if any(k in alt for k in ["author", "avatar", "byline"]) \
+           or any(k in classes for k in ["author", "avatar", "byline"]) \
+           or "madeline%20grecek.png" in src \
+           or "madeline grecek" in alt:
+            to_remove.append(img)
+
+        # თუ img არის <p>-ში და ის <p> არაფერს სხვას არ შეიცავს (ხშირად ავტორის ბლოკი)
+        parent = img.parent
+        if parent and parent.name == "p":
+            only_img = True
+            for c in parent.children:
+                if getattr(c, "name", None) is None:
+                    # ტექსტი არსებობს და არა მხოლოდ whitespace?
+                    if str(c).strip():
+                        only_img = False
+                        break
+                elif c.name != "img":
+                    only_img = False
+                    break
+            if only_img and ("author" in classes or "avatar" in classes or "byline" in classes):
+                to_remove.append(parent)
+
+    for node in to_remove:
+        node.decompose()
 
 # ------------------------------
-# Helper: HTML გაწმენდა
+# HTML გაწმენდა
 # ------------------------------
 def clean_article(article):
     # წაშალე script/style/svg/noscript
     for tag in article(["script", "style", "svg", "noscript"]):
         tag.decompose()
 
-    # გაასუფთავე ატრიბუტები
+    # გაასუფთავე ატრიბუტები; <img> დატოვე ნორმალიზებული src/alt-ით
     for tag in article.find_all(True):
         if tag.name not in [
             "p", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -154,10 +172,11 @@ def clean_article(article):
             continue
 
         if tag.name == "img":
-            src = _img_src_from_tag(tag)
-            alt = (tag.get("alt") or "").strip() or "Image"
-            tag.attrs = {"src": src or "", "alt": alt}
+            src = _img_src_from_tag(tag) or ""
+            alt = (tag.get("alt") or "Image").strip()
+            tag.attrs = {"src": src, "alt": alt}
         else:
+            # ყველა სხვა ატრიბუტი ვშლით, რომ სუფთა HTML მივიღოთ
             tag.attrs = {}
 
     return article
@@ -178,21 +197,13 @@ def extract_blog_content(html: str):
     if not article:
         article = soup.body
 
-    # --- ამოიღე ჰედშოტები (მაგ: Madeline Grecek) სანამ ბანერს ჩავსვამთ ---
-    for img in list(article.find_all("img")):
-        try:
-            if _looks_like_headshot(img):
-                img.decompose()
-        except Exception:
-            pass
-
     # --- H1 ---
     h1 = soup.find("h1")
 
-    # --- ბანერი მოძებნე wrapper-იდან/შეგროვილი style-დან/og:image-დან ---
+    # --- ბანერი მოძებნე ---
     banner_url = find_banner_url(soup)
 
-    # article-ის თავში: ჯერ H1 (თუ არ ზის უკვე), მერე ბანერი <p><img .../></p>
+    # article-ის თავში: ჯერ H1 (თუ იარსება), მერე ბანერი როგორც <p><img .../></p>
     if h1:
         article.insert(0, h1)
     if banner_url:
@@ -201,6 +212,10 @@ def extract_blog_content(html: str):
         p.append(img)
         article.insert(1, p)
 
+    # ავტორის სურათების მოცილება (თუ დარჩა)
+    remove_author_images(article)
+
+    # გაწმენდა და ნორმალიზაცია
     return clean_article(article)
 
 # ------------------------------
@@ -223,8 +238,8 @@ def scrape_blog():
         # Title
         # ====================
         title = None
-        if soup.title and soup.title.string:
-            title = soup.title.string.strip()
+        if soup.title:
+            title = (soup.title.string or "").strip()
         h1 = soup.find("h1")
         if h1 and not title:
             title = h1.get_text(strip=True)
@@ -238,22 +253,16 @@ def scrape_blog():
             return Response("Could not extract blog content", status=422)
 
         # ====================
-        # Images
+        # Images (order-preserving unique)
         # ====================
         images = []
-
-        # ბანერი (იმავე ლოგიკით)
         banner_url = find_banner_url(soup)
         if banner_url:
             images.append(banner_url)
 
-        # article-ის შიდა სურათები
-        for img_url in extract_images(article):
-            # ამოიღე ჰედშოტები და დუბლიკატები
-            if ("Madeline%20Grecek" in img_url) or ("Madeline Grecek" in img_url):
-                continue
-            if img_url not in images:
-                images.append(img_url)
+        for img in extract_images(article):
+            if img not in images:
+                images.append(img)
 
         # სახელების გენერაცია
         image_names = [f"image{i+1}.png" for i in range(len(images))]
