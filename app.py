@@ -119,14 +119,12 @@ def extract_blog_content(html: str):
     h1 = soup.find("h1")
     banner_img = None
 
-    # ეძებს wrapper-banner-image div-ში
-    banner_div = soup.find("div", class_="wrapper-banner-image")
-    if banner_div:
-        img_tag = banner_div.find("img")
-        if img_tag and img_tag.get("src"):
-            banner_img = img_tag
+    if h1:
+        next_img = h1.find_next("img")
+        if next_img:
+            banner_img = next_img
 
-    # article-ის თავში prepend
+    # article-ის თავში prepend (სრულიად article-ის შიგნით ვტოვებთ)
     if h1:
         article.insert(0, h1)
     if banner_img:
