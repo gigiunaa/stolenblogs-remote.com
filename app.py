@@ -31,6 +31,12 @@ def extract_images(container):
         )
         if not src and img.get("srcset"):
             src = img["srcset"].split(",")[0].split()[0]
+
+        # ამოვრიცხოთ ავტორის ფოტოები
+        alt_text = (img.get("alt") or "").lower()
+        if "author" in alt_text or "profile" in alt_text:
+            continue
+
         if src:
             if src.startswith("//"):
                 src = "https:" + src
@@ -100,12 +106,27 @@ def clean_article(article):
     return article
 
 # ------------------------------
+# Helper: ბანერის ამოღება
+# ------------------------------
+def extract_banner(soup):
+    # 1) სცადე wrapper-banner-image
+    banner_div = soup.find("div", class_="wrapper-banner-image")
+    if banner_div:
+        img = banner_div.find("img")
+        if img and img.get("src"):
+            return img["src"].strip(), img.get("alt", "Banner")
+
+    # 2) fallback: og:image
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        return og["content"].strip(), "Banner"
+
+    return None, None
+
+# ------------------------------
 # Blog content extraction
 # ------------------------------
-def extract_blog_content(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-
-    # მთავარი article მოძებნე
+def extract_blog_content(html: str, soup):
     article = soup.find("article")
     if not article:
         for cls in ["blog-content", "post-content", "entry-content", "content", "article-body"]:
@@ -115,24 +136,23 @@ def extract_blog_content(html: str):
     if not article:
         article = soup.body
 
-    # --- ამოვიღოთ h1 და banner ---
+    # --- ამოვიღოთ h1 ---
     h1 = soup.find("h1")
-    banner_img = None
 
-    if h1:
-        next_img = h1.find_next("img")
-        if next_img:
-            banner_img = next_img
+    # --- ამოვიღოთ banner ---
+    banner_url, banner_alt = extract_banner(soup)
 
-    # article-ის თავში prepend
+    # ჩასმა article-ის თავში
+    if banner_url:
+        banner_tag = soup.new_tag("p")
+        img_tag = soup.new_tag("img", src=banner_url, alt=banner_alt)
+        banner_tag.append(img_tag)
+        article.insert(0, banner_tag)
+
     if h1:
         article.insert(0, h1)
-    if banner_img:
-        wrapper_p = soup.new_tag("p")
-        wrapper_p.append(banner_img)
-        article.insert(1, wrapper_p)
 
-    return clean_article(article)
+    return clean_article(article), banner_url
 
 # ------------------------------
 # API
@@ -164,7 +184,7 @@ def scrape_blog():
         # ====================
         # Blog content
         # ====================
-        article = extract_blog_content(resp.text)
+        article, banner_url = extract_blog_content(resp.text, soup)
         if not article:
             return Response("Could not extract blog content", status=422)
 
@@ -172,26 +192,18 @@ def scrape_blog():
         # Images
         # ====================
         images = []
-        banner_url = None
+        if banner_url:
+            images.append(banner_url)
 
-        # 1) Banner (og:image)
-        og = soup.find("meta", property="og:image")
-        if og and og.get("content"):
-            banner_url = og["content"].strip()
-            if banner_url:
-                images.append(banner_url)
-
-        # 2) Article images
         article_images = extract_images(article)
         for img in article_images:
             if img not in images:
                 images.append(img)
 
-        # 3) Naming
         image_names = [f"image{i+1}.png" for i in range(len(images))]
 
         # ====================
-        # Build content_html
+        # content_html
         # ====================
         content_html = str(article).strip()
 
